@@ -30,6 +30,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
+# Hybrid ETD (Encode-Think-Decode) architecture:
+# - Unique encoder layers map input to latent space (with U-Net skip storage)
+# - Shared "think" layers loop multiple times (iterative refinement)
+# - Unique decoder layers map back to output space (with U-Net skip consumption)
+# This combines the best of both worlds: unique capacity where layers do
+# fundamentally different jobs, and parameter-efficient looping where
+# iterative refinement is needed.
 
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -51,10 +58,12 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape
+    # Model shape - ETD hybrid architecture
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_shared_layers = int(os.environ.get("NUM_SHARED_LAYERS", 3))
-    max_passes = int(os.environ.get("MAX_PASSES", 3))
+    num_encoder_layers = int(os.environ.get("NUM_ENCODER_LAYERS", 3))  # Unique front layers
+    num_think_layers = int(os.environ.get("NUM_THINK_LAYERS", 3))      # Shared looped layers
+    num_think_passes = int(os.environ.get("NUM_THINK_PASSES", 2))      # Times to loop think layers
+    num_decoder_layers = int(os.environ.get("NUM_DECODER_LAYERS", 3))  # Unique back layers
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -585,10 +594,9 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, use_x0: bool = True) -> Tensor:
-        if use_x0:
-            mix = self.resid_mix.to(dtype=x.dtype)
-            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -599,8 +607,10 @@ class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        num_shared_layers: int,
-        max_passes: int,
+        num_encoder_layers: int,
+        num_think_layers: int,
+        num_think_passes: int,
+        num_decoder_layers: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -614,24 +624,39 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.max_passes = max_passes
+        self.num_encoder_layers = num_encoder_layers
+        self.num_think_layers = num_think_layers
+        self.num_think_passes = num_think_passes
+        self.num_decoder_layers = num_decoder_layers
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
-        # Universal Transformer: shared layers looped multiple times
-        self.blocks = nn.ModuleList(
-            [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-                for _ in range(num_shared_layers)
-            ]
+        block_args = dict(
+            dim=model_dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
+            mlp_mult=mlp_mult, rope_base=rope_base, qk_gain_init=qk_gain_init,
         )
 
-        # Pass embedding: lets the model distinguish recursion depth
-        self.pass_emb = nn.Embedding(max_passes, model_dim)
+        # ENCODE: unique front layers (store U-Net skips)
+        self.encoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_encoder_layers)])
+
+        # THINK: shared layers looped num_think_passes times
+        self.think_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_think_layers)])
+
+        # Pass embedding for the think loop (distinguishes recursion depth)
+        self.pass_emb = nn.Embedding(num_think_passes, model_dim)
+
+        # DECODE: unique back layers (consume U-Net skips in reverse)
+        self.decoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_decoder_layers)])
+
+        # U-Net skip weights: connect encoder outputs to decoder inputs
+        # Number of skip connections = min(encoder, decoder) layers
+        self.num_skip_connections = min(num_encoder_layers, num_decoder_layers)
+        self.skip_weights = nn.Parameter(
+            torch.ones(self.num_skip_connections, model_dim, dtype=torch.float32)
+        )
 
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -645,40 +670,45 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
-                if getattr(module, "bias", None) is not None:
-                    nn.init.zeros_(module.bias)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        _, _, dim = x.shape
+        # ---- ENCODE: unique layers, store skips ----
+        skips: list[Tensor] = []
+        for block in self.encoder_blocks:
+            x = block(x, x0)
+            skips.append(x)
 
-        for pass_idx in range(self.max_passes):
-            use_x0 = (pass_idx == 0)
-
-            # Inject pass embedding so the model distinguishes recursion depth
+        # ---- THINK: shared layers looped multiple times ----
+        for pass_idx in range(self.num_think_passes):
             pass_idx_tensor = torch.tensor(pass_idx, device=x.device)
             pass_vec = self.pass_emb(pass_idx_tensor)
             x = x + pass_vec.unsqueeze(0).unsqueeze(0)
 
-            # Single pass through shared blocks
-            for block in self.blocks:
-                x = block(x, x0, use_x0=use_x0)
+            for block in self.think_blocks:
+                x = block(x, x0)
 
-        x = self.final_norm(x).reshape(-1, dim)
+        # ---- DECODE: unique layers, consume skips in reverse ----
+        for i, block in enumerate(self.decoder_blocks):
+            if i < self.num_skip_connections and skips:
+                skip = skips.pop()
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
+            x = block(x, x0)
+
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+
 
 # -----------------------------
 # TRAINING
@@ -780,8 +810,10 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_shared_layers=args.num_shared_layers,
-        max_passes=args.max_passes,
+        num_encoder_layers=args.num_encoder_layers,
+        num_think_layers=args.num_think_layers,
+        num_think_passes=args.num_think_passes,
+        num_decoder_layers=args.num_decoder_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -799,19 +831,25 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split
-    block_named_params = list(base_model.blocks.named_parameters())
+    # Collect all block params across encoder, think, decoder
+    all_block_named_params = (
+        list(base_model.encoder_blocks.named_parameters())
+        + list(base_model.think_blocks.named_parameters())
+        + list(base_model.decoder_blocks.named_parameters())
+    )
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in all_block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in all_block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    # Add pass embedding to the scalar optimizer group
+    # Add skip weights and pass embedding to scalar optimizer
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
     scalar_params.extend(list(base_model.pass_emb.parameters()))
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -846,7 +884,16 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    total_effective_layers = args.num_encoder_layers + (args.num_think_layers * args.num_think_passes) + args.num_decoder_layers
+    unique_layer_blocks = args.num_encoder_layers + args.num_think_layers + args.num_decoder_layers
     log0(f"model_params:{n_params}")
+    log0(
+        f"architecture:ETD encoder:{args.num_encoder_layers} "
+        f"think:{args.num_think_layers}x{args.num_think_passes} "
+        f"decoder:{args.num_decoder_layers} "
+        f"effective_depth:{total_effective_layers} unique_blocks:{unique_layer_blocks} "
+        f"skip_connections:{base_model.num_skip_connections}"
+    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
