@@ -64,13 +64,26 @@ class Hyperparameters:
     num_think_layers = int(os.environ.get("NUM_THINK_LAYERS", 3))      # Shared looped layers
     num_think_passes = int(os.environ.get("NUM_THINK_PASSES", 2))      # Times to loop think layers
     num_decoder_layers = int(os.environ.get("NUM_DECODER_LAYERS", 3))  # Unique back layers
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Encoder/Decoder block config
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+
+    # Think block config (defaults to same as encoder/decoder if not set)
+    # THINK_NUM_HEADS=0 means use NUM_HEADS, THINK_KV_HEADS=0 means use NUM_KV_HEADS
+    # THINK_MLP_MULT=0 means use MLP_MULT, otherwise must be >= 1
+    think_num_heads = int(os.environ.get("THINK_NUM_HEADS", 0)) or num_heads
+    think_kv_heads = int(os.environ.get("THINK_KV_HEADS", 0)) or num_kv_heads
+    think_mlp_mult = int(os.environ.get("THINK_MLP_MULT", 0))
+    if think_mlp_mult == 0:
+        think_mlp_mult = mlp_mult
+    if think_mlp_mult < 1:
+        raise ValueError(f"THINK_MLP_MULT must be >= 1 or -1 for default, got {think_mlp_mult}")
 
     # Optimizer hyperparameters
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -586,44 +599,23 @@ class Block(nn.Module):
         qk_gain_init: float,
     ):
         super().__init__()
+        self.has_mlp = mlp_mult > 0
         self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        if self.has_mlp:
+            self.mlp_norm = RMSNorm()
+            self.mlp = MLP(dim, mlp_mult)
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
-
-
-class LiteBlock(nn.Module):
-    """Attention-only block for think layers — no MLP, ~57% cheaper per iteration."""
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
-        super().__init__()
-        self.attn_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        if self.has_mlp:
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -639,6 +631,9 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
+        think_num_heads: int,
+        think_kv_heads: int,
+        think_mlp_mult: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -663,25 +658,17 @@ class GPT(nn.Module):
             mlp_mult=mlp_mult, rope_base=rope_base, qk_gain_init=qk_gain_init,
         )
 
+        # Think blocks get their own config (can be lighter)
+        think_block_args = dict(
+            dim=model_dim, num_heads=think_num_heads, num_kv_heads=think_kv_heads,
+            mlp_mult=think_mlp_mult, rope_base=rope_base, qk_gain_init=qk_gain_init,
+        )
+
         # ENCODE: unique front layers (store U-Net skips)
         self.encoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_encoder_layers)])
 
-        # THINK: shared LITE layers (attention-only) looped num_think_passes times
-        lite_block_args = dict(
-            dim=model_dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
-            rope_base=rope_base, qk_gain_init=qk_gain_init,
-        )
-        # THINK: shared layers (no MLP) looped num_think_passes times
-     
-        '''
-        self.think_blocks = nn.ModuleList([
-            Block(**block_args, use_mlp=False) for _ in range(num_think_layers)
-        ])'''
-
-        self.think_blocks = nn.ModuleList([
-            *[LiteBlock(**lite_block_args) for _ in range(num_think_layers - 1)],
-            Block(**block_args),
-        ])
+        # THINK: shared layers looped num_think_passes times (configurable size)
+        self.think_blocks = nn.ModuleList([Block(**think_block_args) for _ in range(num_think_layers)])
 
         # Pass embedding for the think loop (distinguishes recursion depth)
         self.pass_emb = nn.Embedding(num_think_passes, model_dim)
@@ -856,6 +843,9 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        think_num_heads=args.think_num_heads,
+        think_kv_heads=args.think_kv_heads,
+        think_mlp_mult=args.think_mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -931,6 +921,10 @@ def main() -> None:
         f"decoder:{args.num_decoder_layers} "
         f"effective_depth:{total_effective_layers} unique_blocks:{unique_layer_blocks} "
         f"skip_connections:{base_model.num_skip_connections}"
+    )
+    log0(
+        f"enc/dec_blocks: heads={args.num_heads} kv={args.num_kv_heads} mlp={args.mlp_mult}x | "
+        f"think_blocks: heads={args.think_num_heads} kv={args.think_kv_heads} mlp={args.think_mlp_mult}x"
     )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
