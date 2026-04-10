@@ -76,11 +76,11 @@ class Hyperparameters:
 
     # Think block config (defaults to same as encoder/decoder if not set)
     # THINK_NUM_HEADS=0 means use NUM_HEADS, THINK_KV_HEADS=0 means use NUM_KV_HEADS
-    # THINK_MLP_MULT=-1 means use MLP_MULT, otherwise must be >= 1
+    # THINK_MLP_MULT=0 means use MLP_MULT, otherwise must be >= 1
     think_num_heads = int(os.environ.get("THINK_NUM_HEADS", 0)) or num_heads
     think_kv_heads = int(os.environ.get("THINK_KV_HEADS", 0)) or num_kv_heads
-    think_mlp_mult = int(os.environ.get("THINK_MLP_MULT", -1))
-    if think_mlp_mult == -1:
+    think_mlp_mult = int(os.environ.get("THINK_MLP_MULT", 0))
+    if think_mlp_mult == 0:
         think_mlp_mult = mlp_mult
     if think_mlp_mult < 1:
         raise ValueError(f"THINK_MLP_MULT must be >= 1 or -1 for default, got {think_mlp_mult}")
