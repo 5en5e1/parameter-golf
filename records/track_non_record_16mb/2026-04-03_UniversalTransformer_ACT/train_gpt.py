@@ -31,12 +31,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # HYPERPARAMETERS
 # -----------------------------
 # Hybrid ETD (Encode-Think-Decode) architecture:
-# - Unique encoder layers map input to latent space (with U-Net skip storage)
+# - Recursive encoder layers map input to latent space (think-config, with U-Net skip storage on last pass)
 # - Shared "think" layers loop multiple times (iterative refinement)
 # - Unique decoder layers map back to output space (with U-Net skip consumption)
-# This combines the best of both worlds: unique capacity where layers do
-# fundamentally different jobs, and parameter-efficient looping where
-# iterative refinement is needed.
+# Encoder and think blocks share config and int8 quantization.
+# Only decoder blocks use aggressive quantization (int6) with Noisy QAT.
 
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -60,7 +59,8 @@ class Hyperparameters:
 
     # Model shape - ETD hybrid architecture
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_encoder_layers = int(os.environ.get("NUM_ENCODER_LAYERS", 3))  # Unique front layers
+    num_encoder_layers = int(os.environ.get("NUM_ENCODER_LAYERS", 3))  # Recursive front layers (think-config)
+    num_encoder_passes = int(os.environ.get("NUM_ENCODER_PASSES", 2))  # Times to loop encoder layers
     num_think_layers = int(os.environ.get("NUM_THINK_LAYERS", 3))      # Shared looped layers
     num_think_passes = int(os.environ.get("NUM_THINK_PASSES", 2))      # Times to loop think layers
     num_decoder_layers = int(os.environ.get("NUM_DECODER_LAYERS", 3))  # Unique back layers
@@ -69,12 +69,12 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Encoder/Decoder block config
+    # Decoder block config (unique layers, aggressively quantized)
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
 
-    # Think block config (defaults to same as encoder/decoder if not set)
+    # Think/Encoder block config (shared recursive layers, int8 quantized)
     # THINK_NUM_HEADS=0 means use NUM_HEADS, THINK_KV_HEADS=0 means use NUM_KV_HEADS
     # THINK_MLP_MULT=0 means use MLP_MULT, otherwise must be >= 1
     think_num_heads = int(os.environ.get("THINK_NUM_HEADS", 0)) or num_heads
@@ -100,13 +100,14 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
 
     # Mixed precision quantization
-    # QUANT_BITS: bits for encoder/decoder weights (default 8)
-    # THINK_QUANT_BITS: bits for think block weights (default 8, use 8 to preserve loop precision)
+    # QUANT_BITS: bits for decoder weights (default 8, set to 6 for aggressive compression)
+    # Encoder and think blocks always use int8 (recursive layers need precision)
     quant_bits = int(os.environ.get("QUANT_BITS", 8))
-    think_quant_bits = int(os.environ.get("THINK_QUANT_BITS", 8))
+think_quant_bits = int(os.environ.get("THINK_QUANT_BITS", 8))
+ 
 
-    # Noisy QAT: inject quantization-calibrated noise into think block weights during training
-    # Trains think weights to be robust to quantization error that compounds through loop passes
+    # Noisy QAT: inject quantization-calibrated noise into decoder block weights during training
+    # Only decoder needs QAT since it's the only stage with aggressive (sub-int8) quantization
     noisy_qat = bool(int(os.environ.get("NOISY_QAT", 0)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
@@ -345,7 +346,8 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], tensor_bits: dict[str, int] | None = None):
     # Mixed precision: tensor_bits maps tensor name patterns to bit widths.
-    # e.g. {"think_blocks": 8, "default": 6} means think blocks get int8, rest get int6.
+    # e.g. {"think_blocks": 8, "encoder_blocks": 8, "default": 6} means
+    # think/encoder blocks get int8, decoder gets int6.
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -661,6 +663,7 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_encoder_layers: int,
+        num_encoder_passes: int,
         num_think_layers: int,
         num_think_passes: int,
         num_decoder_layers: int,
@@ -684,27 +687,30 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.num_encoder_layers = num_encoder_layers
+        self.num_encoder_passes = num_encoder_passes
         self.num_think_layers = num_think_layers
         self.num_think_passes = num_think_passes
         self.num_decoder_layers = num_decoder_layers
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
+        # Decoder blocks get their own config (unique layers, aggressively quantized)
         block_args = dict(
             dim=model_dim, num_heads=num_heads, num_kv_heads=num_kv_heads,
             mlp_mult=mlp_mult, rope_base=rope_base, qk_gain_init=qk_gain_init,
         )
 
-        # Think blocks get their own config (can be lighter)
+        # Think/Encoder blocks share config (recursive layers, int8 quantized)
         think_block_args = dict(
             dim=model_dim, num_heads=think_num_heads, num_kv_heads=think_kv_heads,
             mlp_mult=think_mlp_mult, rope_base=rope_base, qk_gain_init=qk_gain_init,
         )
 
-        # ENCODE: unique front layers (store U-Net skips)
-        self.encoder_blocks = nn.ModuleList([Block(**block_args) for _ in range(num_encoder_layers)])
+        # ENCODE: recursive layers using think-config, looped num_encoder_passes times
+        self.encoder_blocks = nn.ModuleList([Block(**think_block_args) for _ in range(num_encoder_layers)])
+        self.encoder_pass_emb = nn.Embedding(num_encoder_passes, model_dim)
 
-        # THINK: shared layers looped num_think_passes times (configurable size)
+        # THINK: shared layers looped num_think_passes times (think-config)
         self.think_blocks = nn.ModuleList([Block(**think_block_args) for _ in range(num_think_layers)])
 
         # Pass embedding for the think loop (distinguishes recursion depth)
@@ -738,11 +744,16 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        # ---- ENCODE: unique layers, store skips ----
+        # ---- ENCODE: recursive layers, store skips on last pass ----
         skips: list[Tensor] = []
-        for block in self.encoder_blocks:
-            x = block(x, x0)
-            skips.append(x)
+        for pass_idx in range(self.num_encoder_passes):
+            pass_vec = self.encoder_pass_emb(torch.tensor(pass_idx, device=x.device))
+            x = x + pass_vec.unsqueeze(0).unsqueeze(0)
+            last_pass = (pass_idx == self.num_encoder_passes - 1)
+            for block in self.encoder_blocks:
+                x = block(x, x0)
+                if last_pass:
+                    skips.append(x)
 
         # ---- THINK: shared layers looped multiple times ----
         for pass_idx in range(self.num_think_passes):
@@ -873,6 +884,7 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_encoder_layers=args.num_encoder_layers,
+        num_encoder_passes=args.num_encoder_passes,
         num_think_layers=args.num_think_layers,
         num_think_passes=args.num_think_passes,
         num_decoder_layers=args.num_decoder_layers,
@@ -894,13 +906,12 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
-    # Enable Noisy QAT on enc/dec blocks
+    # Enable Noisy QAT on decoder blocks only (they get aggressive int6 quantization)
     if args.noisy_qat:
-    for blocks in (base_model.encoder_blocks, base_model.decoder_blocks):
-        for module in blocks.modules():
+        for module in base_model.decoder_blocks.modules():
             if isinstance(module, CastedLinear):
                 module._noisy_qat = True
-                module._noisy_qat_bits = args.quant_bi
+                module._noisy_qat_bits = args.quant_bits
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -921,10 +932,11 @@ def main() -> None:
         for name, p in all_block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    # Add skip weights and pass embedding to scalar optimizer
+    # Add skip weights and pass embeddings to scalar optimizer
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.extend(list(base_model.pass_emb.parameters()))
+    scalar_params.extend(list(base_model.encoder_pass_emb.parameters()))
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -958,19 +970,19 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    total_effective_layers = args.num_encoder_layers + (args.num_think_layers * args.num_think_passes) + args.num_decoder_layers
+    total_effective_layers = (args.num_encoder_layers * args.num_encoder_passes) + (args.num_think_layers * args.num_think_passes) + args.num_decoder_layers
     unique_layer_blocks = args.num_encoder_layers + args.num_think_layers + args.num_decoder_layers
     log0(f"model_params:{n_params}")
     log0(
-        f"architecture:ETD encoder:{args.num_encoder_layers} "
+        f"architecture:ETD encoder:{args.num_encoder_layers}x{args.num_encoder_passes} "
         f"think:{args.num_think_layers}x{args.num_think_passes} "
         f"decoder:{args.num_decoder_layers} "
         f"effective_depth:{total_effective_layers} unique_blocks:{unique_layer_blocks} "
         f"skip_connections:{base_model.num_skip_connections}"
     )
     log0(
-        f"enc/dec_blocks: heads={args.num_heads} kv={args.num_kv_heads} mlp={args.mlp_mult}x | "
-        f"think_blocks: heads={args.think_num_heads} kv={args.think_kv_heads} mlp={args.think_mlp_mult}x"
+        f"decoder_blocks: heads={args.num_heads} kv={args.num_kv_heads} mlp={args.mlp_mult}x | "
+        f"encoder/think_blocks: heads={args.think_num_heads} kv={args.think_kv_heads} mlp={args.think_mlp_mult}x"
     )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1138,12 +1150,13 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    # Mixed precision quantization: think blocks get more bits, encoder/decoder get fewer
+    # Mixed precision quantization: encoder/think blocks get int8, decoder gets quant_bits (e.g. int6)
     tensor_bits = {
         "think_blocks": args.think_quant_bits,
+        "encoder_blocks": args.think_quant_bits,
         "default": args.quant_bits,
     }
-    log0(f"quantization: encoder/decoder={args.quant_bits}bit think={args.think_quant_bits}bit noisy_qat={args.noisy_qat}")
+    log0(f"quantization: encoder/think=int8 decoder={args.quant_bits}bit noisy_qat={args.noisy_qat}")
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), tensor_bits=tensor_bits)
     quant_buf = io.BytesIO()
