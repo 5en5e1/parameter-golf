@@ -894,12 +894,13 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
-    # Enable Noisy QAT on think block weights only
+    # Enable Noisy QAT on enc/dec blocks
     if args.noisy_qat:
-        for module in base_model.think_blocks.modules():
+    for blocks in (base_model.encoder_blocks, base_model.decoder_blocks):
+        for module in blocks.modules():
             if isinstance(module, CastedLinear):
                 module._noisy_qat = True
-                module._noisy_qat_bits = args.think_quant_bits
+                module._noisy_qat_bits = args.quant_bi
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
