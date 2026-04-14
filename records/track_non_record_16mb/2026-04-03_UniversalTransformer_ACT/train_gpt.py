@@ -103,7 +103,7 @@ class Hyperparameters:
     # QUANT_BITS: bits for decoder weights (default 8, set to 6 for aggressive compression)
     # Encoder and think blocks always use int8 (recursive layers need precision)
     quant_bits = int(os.environ.get("QUANT_BITS", 8))
-think_quant_bits = int(os.environ.get("THINK_QUANT_BITS", 8))
+    think_quant_bits = int(os.environ.get("THINK_QUANT_BITS", 8))
  
 
     # Noisy QAT: inject quantization-calibrated noise into decoder block weights during training
