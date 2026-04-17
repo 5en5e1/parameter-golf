@@ -107,7 +107,6 @@ class Hyperparameters:
 
     # Noisy QAT: inject quantization-calibrated noise into think block weights during training
     # Trains think weights to be robust to quantization error that compounds through loop passes
-    noisy_qat = bool(int(os.environ.get("NOISY_QAT", 0)))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
@@ -511,22 +510,9 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # Supports Noisy QAT: when _noisy_qat=True, injects quantization-calibrated noise during training.
-    _noisy_qat: bool = False
-    _noisy_qat_bits: int = 8
-
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight.to(x.dtype)
-        if self.training and self._noisy_qat:
-            with torch.no_grad():
-                max_val = (1 << (self._noisy_qat_bits - 1)) - 1  # 127 for int8, 15 for int5
-                amax = self.weight.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
-                step_size = amax / max_val
-            noise = (torch.rand_like(w) - 0.5) * step_size.to(w.dtype)
-            w = w + noise
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w, bias)
-
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
@@ -621,7 +607,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
         return self.proj(x.square())
 
 
@@ -894,12 +880,6 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
-    # Enable Noisy QAT on think block weights only
-    if args.noisy_qat:
-        for module in base_model.think_blocks.modules():
-            if isinstance(module, CastedLinear):
-                module._noisy_qat = True
-                module._noisy_qat_bits = args.think_quant_bits
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -1142,7 +1122,7 @@ def main() -> None:
         "think_blocks": args.think_quant_bits,
         "default": args.quant_bits,
     }
-    log0(f"quantization: encoder/decoder={args.quant_bits}bit think={args.think_quant_bits}bit noisy_qat={args.noisy_qat}")
+    log0(f"quantization: encoder/decoder={args.quant_bits}bit think={args.think_quant_bits}")
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), tensor_bits=tensor_bits)
     quant_buf = io.BytesIO()
