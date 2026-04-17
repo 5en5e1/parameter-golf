@@ -83,7 +83,7 @@ class Hyperparameters:
     if think_mlp_mult == 0:
         think_mlp_mult = mlp_mult
     if think_mlp_mult < 1:
-        raise ValueError(f"THINK_MLP_MULT must be >= 1 or -1 for default, got {think_mlp_mult}")
+        raise ValueError(f"THINK_MLP_MULT must be >= 0 , got {think_mlp_mult}")
 
     # Optimizer hyperparameters
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
