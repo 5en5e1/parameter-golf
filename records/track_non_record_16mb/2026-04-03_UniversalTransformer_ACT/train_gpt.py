@@ -63,6 +63,7 @@ class Hyperparameters:
     num_encoder_layers = int(os.environ.get("NUM_ENCODER_LAYERS", 3))  # Unique front layers
     num_think_layers = int(os.environ.get("NUM_THINK_LAYERS", 3))      # Shared looped layers
     num_think_passes = int(os.environ.get("NUM_THINK_PASSES", 2))      # Times to loop think layers
+    enable_think_passes_at = float(os.environ.get("ENABLE_THINK_PASSES_AT", 0.0))  # 0=always full, >0=fraction to enable full passes
     num_decoder_layers = int(os.environ.get("NUM_DECODER_LAYERS", 3))  # Unique back layers
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -790,6 +791,7 @@ class GPT(nn.Module):
 
         # U-Net skip weights: connect encoder outputs to decoder inputs
         # Number of skip connections = min(encoder, decoder) layers
+        self.think_passes_active = num_think_passes
         self.num_skip_connections = min(num_encoder_layers, num_decoder_layers)
         self.skip_weights = nn.Parameter(
             torch.ones(self.num_skip_connections, model_dim, dtype=torch.float32)
@@ -820,7 +822,7 @@ class GPT(nn.Module):
             skips.append(x)
 
         # ---- THINK: shared layers looped multiple times ----
-        for pass_idx in range(self.num_think_passes):
+        for pass_idx in range(self.think_passes_active):
             pass_idx_tensor = torch.tensor(pass_idx, device=x.device)
             pass_vec = self.pass_emb(pass_idx_tensor)
             x = x + pass_vec.unsqueeze(0).unsqueeze(0)
@@ -1110,6 +1112,10 @@ def main() -> None:
 
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
 
+    if args.enable_think_passes_at > 0.0 and args.num_think_passes > 1:
+        base_model.think_passes_active = 1
+        log0(f"think_passes:starting with 1 pass, full {args.num_think_passes} passes at frac={args.enable_think_passes_at}")
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1144,6 +1150,14 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        if (args.enable_think_passes_at > 0.0
+                and base_model.think_passes_active < args.num_think_passes):
+            frac = (elapsed_ms / max_wallclock_ms) if max_wallclock_ms else (step / max(args.iterations, 1))
+            if frac >= args.enable_think_passes_at:
+                base_model.think_passes_active = args.num_think_passes
+                log0(f"think_passes:switched to {args.num_think_passes} passes at step:{step} frac:{frac:.3f}")
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
