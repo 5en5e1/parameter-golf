@@ -125,8 +125,10 @@ class Hyperparameters:
     embed_weight_decay = float(os.environ.get("EMBED_WEIGHT_DECAY", 0.0))
     head_weight_decay = float(os.environ.get("HEAD_WEIGHT_DECAY", 0.0))
     # SDClip: per-row clip = k * std(row). 0 disables (falls back to percentile clip).
-    # For peaky weights at int6 use k≈12.85; for int5 with peaky weights start k≈4.
+    # Matrices: peaky → start k≈4 at int5, k≈12.85 at int6.
+    # Embeddings: keep MUCH wider (top PR uses 20.0) — embedding precision matters more.
     matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 0.0))
+    embed_clip_sigmas = float(os.environ.get("EMBED_CLIP_SIGMAS", 20.0))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -374,7 +376,8 @@ def quantize_float_tensor(t, bits=8, use_rht=False, rht_seed_base=0):
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale, None
 
-def quantize_state_dict_int8(state_dict, tensor_bits=None, hessians=None, use_rht=False, clip_sigmas=0.0):
+def quantize_state_dict_int8(state_dict, tensor_bits=None, hessians=None, use_rht=False,
+                              clip_sigmas=0.0, embed_clip_sigmas=0.0):
     # Mixed precision: tensor_bits maps name substrings to bit widths, e.g. {"think_blocks": 8, "default": 6}.
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
@@ -418,9 +421,11 @@ def quantize_state_dict_int8(state_dict, tensor_bits=None, hessians=None, use_rh
         bits = _get_bits(name)
         seed_base = abs(hash(name)) & 0xFFFFFFFF
         if hessians is not None and name in hessians:
+            # Route the per-tensor SDClip k: embeddings need a much wider clip than matrices.
+            cs = embed_clip_sigmas if "tok_emb" in name else clip_sigmas
             q, s, rht_meta = gptq_quantize_weight(
                 t, hessians[name], bits=bits, use_rht=use_rht, rht_seed_base=seed_base,
-                clip_sigmas=clip_sigmas,
+                clip_sigmas=cs,
             )
             qmeta[name] = {"scheme": "per_row", "axis": 0, "bits": bits, "method": "gptq"}
         else:
@@ -1399,6 +1404,7 @@ def main() -> None:
     quant_obj, quant_stats = quantize_state_dict_int8(
         base_model.state_dict(), tensor_bits=tensor_bits, hessians=hessians,
         use_rht=args.use_rht, clip_sigmas=args.matrix_clip_sigmas,
+        embed_clip_sigmas=args.embed_clip_sigmas,
     )
     if master_process:
         # Roundtrip sanity: catches RHT/inverse bugs before paying eval cost.
