@@ -113,11 +113,20 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    # QuIP-style randomised Hadamard rotation wrapping GPTQ — the real winner (int4 at int6 accuracy).
+    # QuIP-style randomised Hadamard rotation wrapping GPTQ.
     use_rht = bool(int(os.environ.get("USE_RHT", "0")))
-    # Peaky-weight recipe knobs. Empirically small wins in this setup; kept for experimentation.
+    # Peaky-weight recipe — Muon side.
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.09))
     muon_row_norm = bool(int(os.environ.get("MUON_ROW_NORM", "1")))
+    # Peaky-weight recipe — Adam side. WD on the Adam-managed groups (embeddings,
+    # head, scalars). Default 0 keeps existing behaviour; raise to peakify those
+    # tensors too. Top PR uses adam_wd=0.02, embed_wd=0.085.
+    adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.0))
+    embed_weight_decay = float(os.environ.get("EMBED_WEIGHT_DECAY", 0.0))
+    head_weight_decay = float(os.environ.get("HEAD_WEIGHT_DECAY", 0.0))
+    # SDClip: per-row clip = k * std(row). 0 disables (falls back to percentile clip).
+    # For peaky weights at int6 use k≈12.85; for int5 with peaky weights start k≈4.
+    matrix_clip_sigmas = float(os.environ.get("MATRIX_CLIP_SIGMAS", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -365,7 +374,7 @@ def quantize_float_tensor(t, bits=8, use_rht=False, rht_seed_base=0):
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale, None
 
-def quantize_state_dict_int8(state_dict, tensor_bits=None, hessians=None, use_rht=False):
+def quantize_state_dict_int8(state_dict, tensor_bits=None, hessians=None, use_rht=False, clip_sigmas=0.0):
     # Mixed precision: tensor_bits maps name substrings to bit widths, e.g. {"think_blocks": 8, "default": 6}.
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
@@ -410,7 +419,8 @@ def quantize_state_dict_int8(state_dict, tensor_bits=None, hessians=None, use_rh
         seed_base = abs(hash(name)) & 0xFFFFFFFF
         if hessians is not None and name in hessians:
             q, s, rht_meta = gptq_quantize_weight(
-                t, hessians[name], bits=bits, use_rht=use_rht, rht_seed_base=seed_base
+                t, hessians[name], bits=bits, use_rht=use_rht, rht_seed_base=seed_base,
+                clip_sigmas=clip_sigmas,
             )
             qmeta[name] = {"scheme": "per_row", "axis": 0, "bits": bits, "method": "gptq"}
         else:
@@ -518,8 +528,9 @@ def rht_invert(Wq: Tensor, seed_row: int, seed_col: int) -> Tensor:
 def _is_pow2(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
-def gptq_quantize_weight(w, H, bits=6, block_size=128, use_rht=False, rht_seed_base=0):
-    """Returns (q, s, rht_meta). rht_meta = (seed_row, seed_col) or None (when RHT disabled or non-pow2)."""
+def gptq_quantize_weight(w, H, bits=6, block_size=128, use_rht=False, rht_seed_base=0, clip_sigmas=0.0):
+    """Returns (q, s, rht_meta). rht_meta = (seed_row, seed_col) or None.
+    clip_sigmas > 0 → SDClip (per-row k·std). 0 → percentile clip (default)."""
     clip_range = (1 << (bits - 1)) - 1
     w_float = w.float().clone()
     rows, cols = w_float.shape
@@ -550,8 +561,14 @@ def gptq_quantize_weight(w, H, bits=6, block_size=128, use_rht=False, rht_seed_b
     W_perm[:, dead[perm]] = 0
     H = H[perm][:, perm]
     Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
-    clip_abs = torch.quantile(W_orig.abs(), INT8_CLIP_Q, dim=1).clamp_min(1e-10)
-    s = (clip_abs / clip_range).to(torch.float16)
+    if clip_sigmas > 0.0:
+        # SDClip: scale = k·std(row)/clip_range. Wider clip lets long Laplacian-tail
+        # weights through unclipped; only beats percentile clip when weights are peaky.
+        row_std = W_orig.std(dim=1).clamp_min(1e-10)
+        s = (clip_sigmas * row_std / clip_range).to(torch.float16)
+    else:
+        clip_abs = torch.quantile(W_orig.abs(), INT8_CLIP_Q, dim=1).clamp_min(1e-10)
+        s = (clip_abs / clip_range).to(torch.float16)
     sf = s.float()
     Q = torch.zeros(rows, cols, dtype=torch.int8)
     W_work = W_perm.clone()
@@ -1121,10 +1138,11 @@ def main() -> None:
     scalar_params.extend(list(base_model.pass_emb.parameters()))
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.embed_weight_decay,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1137,18 +1155,20 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
+        optimizer_head = torch.optim.AdamW(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.head_weight_decay,
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
@@ -1377,7 +1397,8 @@ def main() -> None:
 
     pre_quant = {n: t.detach().cpu().float().clone() for n, t in base_model.state_dict().items()}
     quant_obj, quant_stats = quantize_state_dict_int8(
-        base_model.state_dict(), tensor_bits=tensor_bits, hessians=hessians, use_rht=args.use_rht,
+        base_model.state_dict(), tensor_bits=tensor_bits, hessians=hessians,
+        use_rht=args.use_rht, clip_sigmas=args.matrix_clip_sigmas,
     )
     if master_process:
         # Roundtrip sanity: catches RHT/inverse bugs before paying eval cost.
