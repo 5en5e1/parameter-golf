@@ -101,8 +101,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
 
     # Mixed precision quantization
-    quant_bits = int(os.environ.get("QUANT_BITS", 6))
-    think_quant_bits = int(os.environ.get("THINK_QUANT_BITS", 6))
+    quant_bits = int(os.environ.get("QUANT_BITS", 5))
+    think_quant_bits = int(os.environ.get("THINK_QUANT_BITS", 5))
     embed_bits = int(os.environ.get("EMBED_BITS", 8))
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
@@ -335,7 +335,7 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
+INT8_CLIP_PERCENTILE = float(os.environ.get("INT8_CLIP_PERCENTILE", 99.99984))
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
 def tensor_nbytes(t: Tensor) -> int:
