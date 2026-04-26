@@ -13,14 +13,14 @@ The result reaches **1.1169 BPB** at 15.87 MB. Hyperparameters are **not optimiz
 A hybrid **Encode–Think–Decode (ETD)** transformer:
 
 ```
-input → [4 unique ENCODE blocks] → [3 shared THINK blocks] × 3 passes → [4 unique DECODE blocks] → output
+input → [3 unique ENCODE blocks] → [3 shared THINK blocks] × 3 passes → [4 unique DECODE blocks] → output
                   │                                                              ▲
                   └──────────────── U-Net skip connections (×3) ─────────────────┘
 ```
 
 Pure depth recurrence (Universal Transformer-style) loses the capacity that unique early/late layers provide. Pure stacking pays full parameter cost for every layer of effective depth. ETD uses **unique blocks where layers do fundamentally different jobs** (input mapping at the front, output projection at the back) and **shared looped blocks for the iterative-refinement middle**, where the same operation can usefully be re-applied.
 
-**Effective depth = 17, unique blocks = 11** at the same 16 MB disk budget as a 9-layer naive baseline.
+**Effective depth = 16, unique blocks = 10** at the same 16 MB disk budget as a 9-layer naive baseline.
 
 ### Specifics
 
@@ -29,10 +29,10 @@ Pure depth recurrence (Universal Transformer-style) loses the capacity that uniq
 | `d_model` | 512 |
 | Heads / KV heads | 8 / 4 (GQA) |
 | MLP multiplier | 4× with **LeakyReLU(0.5)²** activation |
-| Encoder blocks (unique) | 4 |
+| Encoder blocks (unique) | 3 |
 | Think blocks (shared) | 3, looped × **3 passes** |
 | Decoder blocks (unique) | 4 |
-| Effective depth | 17 |
+| Effective depth | 16 |
 | U-Net skip connections | 3 (encoder layers → first 3 decoder layers, learned per-channel weights) |
 | Pass embedding | `nn.Embedding(num_passes, d_model)` added at each think pass |
 | Tokenizer | SentencePiece BPE, **vocab 8192** (fineweb10B_sp8192) |
@@ -158,8 +158,8 @@ The `rm` is required because the download script caches a manifest from the defa
 ### Run
 
 ```bash
-export RUN_ID=etd_43x34_mlpx4x4_int5_SD6_pr40
-export NUM_ENCODER_LAYERS=4
+export RUN_ID=etd_33x34_mlpx4x4_int5_SD6_pr40
+export NUM_ENCODER_LAYERS=3
 export NUM_THINK_LAYERS=3
 export NUM_THINK_PASSES=3
 export NUM_DECODER_LAYERS=4
