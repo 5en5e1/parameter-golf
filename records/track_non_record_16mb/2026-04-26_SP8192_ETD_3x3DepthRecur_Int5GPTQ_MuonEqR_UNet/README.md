@@ -141,6 +141,22 @@ All of the above need compute. **I am actively trying to secure more budget to d
 
 ## Reproduction
 
+### Setup (one-time)
+
+The submission depends on `brotli` for the int5 compression pipeline, and on the **SP8192 tokenizer + pre-tokenized FineWeb** hosted by @clarkkev on HuggingFace (the official `data/cached_challenge_fineweb.py` ships sp1024/sp4096 by default, not sp8192):
+
+```bash
+pip install brotli
+
+rm -f data/manifest.json
+MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf \
+python3 data/cached_challenge_fineweb.py --variant sp8192 --train-shards 128
+```
+
+The `rm` is required because the download script caches a manifest from the default repo, and a stale one won't include sp8192.
+
+### Run
+
 ```bash
 export RUN_ID=etd_43x34_mlpx4x4_int5_SD6_pr40
 export NUM_ENCODER_LAYERS=4
@@ -189,6 +205,7 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 Compute for this work and the broader exploration sweep was funded by the **OpenAI Advanced Competitor grant** (RunPod credits). The iteration speed required to land on the ETD shape, get the int5 GPTQ + RHT pipeline tight, and tune the compression pipeline would not have been possible without those credits.
 
 Components borrowed from prior leaderboard work:
+- **SP8192 tokenizer + pre-tokenized FineWeb dataset**: [PR #1394](https://github.com/openai/parameter-golf/pull/1394) by @clarkkev — first introduced the 8192-vocab SentencePiece tokenizer and made the pre-tokenized shards publicly available via HuggingFace ([kevclark/parameter-golf](https://huggingface.co/datasets/kevclark/parameter-golf)). This entire submission is downstream of that data being available.
 - **LeakyReLU(0.5)² activation**: [PR #493](https://github.com/openai/parameter-golf/pull/493) by @parinzee, [PR #518](https://github.com/openai/parameter-golf/pull/518) by @sofiabod
 - **MuonEq-R row-normalization**: PR #1260 (@dexhunter)
 - **GPTQ + per-row SDClip**: PR #1394 (@clarkkev)
